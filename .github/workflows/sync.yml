@@ -1,0 +1,103 @@
+name: Sync from upstream
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone this repo
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Clone upstream
+        run: |
+          git clone https://${{ secrets.PAT_TOKEN }}@github.com/kairui1108/cuktech-ble-ha.git /tmp/upstream
+
+      - name: Check version change
+        id: version
+        run: |
+          UPSTREAM_VERSION=$(grep 'version = ' /tmp/upstream/ble_server/pyproject.toml | sed 's/.*version = "\(.*\)".*/\1/')
+          CURRENT_VERSION=$(grep 'version = ' pyproject.toml 2>/dev/null | sed 's/.*version = "\(.*\)".*/\1/' || echo "0.0.0")
+          echo "upstream=$UPSTREAM_VERSION" >> $GITHUB_OUTPUT
+          echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          if [ "$UPSTREAM_VERSION" != "$CURRENT_VERSION" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sync files
+        run: |
+          rsync -av --delete --exclude='.git' --exclude='.github' --exclude='.venv' --exclude='__pycache__' --exclude='*.pyc' /tmp/upstream/ble_server/ ./
+          cp /tmp/upstream/docs/server-readme.md README.md
+          cp /tmp/upstream/docs/server-readme-en.md README.en.md
+          mkdir -p systemd
+          cp /tmp/upstream/ble_server/systemd/* systemd/ 2>/dev/null || true
+
+      - name: Sync release notes
+        run: |
+          cp /tmp/upstream/RELEASE_NOTES.md RELEASE_NOTES.md 2>/dev/null || true
+
+      - name: Extract release notes
+        id: notes
+        run: |
+          VERSION="${{ steps.version.outputs.upstream }}"
+          if [ -f RELEASE_NOTES.md ]; then
+            NOTES=$(awk -v ver="${VERSION}" 'BEGIN{f=0} $0 ~ ("^##[[:space:]]v?" ver){f=1; next} f && $0 ~ "^##[[:space:]]" {exit} f{print}' RELEASE_NOTES.md)
+          fi
+          NOTES="${NOTES:-See commit history for changes.}"
+          {
+            echo "notes<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin https://${{ secrets.PAT_TOKEN }}@github.com/kairui1108/cuktech-ble-server.git
+          git add .
+          if ! git diff --cached --quiet; then
+            VERSION="${{ steps.version.outputs.upstream }}"
+            git commit -m "Sync from upstream (v$VERSION)"
+            git push origin main
+          fi
+
+      - name: Check if release exists
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.upstream }}"
+          if gh release view "v${VERSION}" > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create release
+        if: steps.release.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.version.outputs.upstream }}
+          name: v${{ steps.version.outputs.upstream }}
+          body: |
+            ## Changes
+
+            ${{ steps.notes.outputs.notes }}
+
+            ## Installation
+
+            ```bash
+            git clone https://github.com/kairui1108/cuktech-ble-server.git
+            cd cuktech-ble-server
+            python3 -m venv .venv
+            source .venv/bin/activate
+            pip install -e .
+            ```
+          token: ${{ secrets.PAT_TOKEN }}
