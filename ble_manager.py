@@ -6,10 +6,12 @@ import os
 import time
 
 try:
-    from cuktech_ble.ble import CuktechBLEController, CHAR_CMD_RECV
+    from cuktech_ble.controller import CuktechBLEController, CHAR_CMD_RECV, CHAR_FW_VERSION, AuthConnectionError
+    from cuktech_ble.protocol import READABLE_SETTINGS_PIIDS
 except ImportError:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
-    from cuktech_ble.ble import CuktechBLEController, CHAR_CMD_RECV
+    from cuktech_ble.controller import CuktechBLEController, CHAR_CMD_RECV, CHAR_FW_VERSION, AuthConnectionError
+    from cuktech_ble.protocol import READABLE_SETTINGS_PIIDS
 
 from state import ChargerState, PORT_NAMES, PORT_BITS, PORT_DEFAULT, decode_port, decode_pdo_caps
 
@@ -38,25 +40,78 @@ class BLEManager:
         self.cmd_queue = asyncio.Queue()
         self._stop_event = asyncio.Event()
         self._mqtt_publish = None
+        self._reconnect_attempts = 0
+        self._decrypt_failures = 0
+        self._base_reconnect_delay = config.server.reconnect_base_delay
+        self._max_reconnect_delay = config.server.reconnect_max_delay
+        self._history = None
 
     def set_mqtt_publisher(self, publisher):
         self._mqtt_publish = publisher
 
+    def set_history(self, history):
+        self._history = history
+
+    def _get_reconnect_delay(self):
+        """Calculate exponential backoff delay."""
+        delay = min(
+            self._base_reconnect_delay * (2 ** min(self._reconnect_attempts, 10)),
+            self._max_reconnect_delay
+        )
+        return delay
+
     async def start(self):
         self._stop_event.clear()
+        self._reconnect_attempts = 0
+        self._decrypt_failures = 0
+        self._auth_fail_count = 0
+        first_run = True
+        last_error = None
         while not self._stop_event.is_set():
             try:
                 await self._connect_and_run()
+                self._reconnect_attempts = 0
+                self._decrypt_failures = 0
+                self._auth_fail_count = 0
+                first_run = False
+                last_error = None
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                _LOGGER.error("BLE loop error: %s", e)
+                last_error = e
+                _LOGGER.error("BLE loop error: %s", e, exc_info=True)
             finally:
                 await self._disconnect()
             if not self._stop_event.is_set():
-                _LOGGER.info("Reconnecting in %.0fs...", self.config.server.reconnect_delay)
+                if isinstance(last_error, AuthConnectionError):
+                    # auth 失败可能有两类原因:
+                    # 1. 设备端 session 未清除 (需等待设备自然超时)
+                    # 2. BlueZ GATT 缓存损坏 (需 power cycle 本地适配器)
+                    # 因此 auth 失败也应重置本地适配器，避免陷入永久失败
+                    self._auth_fail_count += 1
+                    await self._force_disconnect_bluetooth()
+                    if self._auth_fail_count >= 5:
+                        _LOGGER.error(
+                            "Auth failed %d times consecutively. "
+                            "Device session is stuck. Please power-cycle the charger "
+                            "(unplug and replug) to reset its BLE session.",
+                            self._auth_fail_count)
+                        self._publish_status({"connected": False, "error": "device_session_stuck"}, retain=True)
+                        # 等待 5 分钟后自动重试（给用户时间手动重启）
+                        delay = 300
+                    else:
+                        delay = min(60 * self._auth_fail_count, 180)
+                    _LOGGER.warning("Auth failed %d times, reset adapter and waiting %ds...",
+                                    self._auth_fail_count, delay)
+                elif last_error:
+                    await self._force_disconnect_bluetooth()
+                    delay = self._get_reconnect_delay()
+                else:
+                    delay = self._get_reconnect_delay()
+                self._reconnect_attempts += 1
+                _LOGGER.info("Reconnecting in %.0fs (attempt %d)...", delay, self._reconnect_attempts)
                 try:
-                    await asyncio.wait_for(self._stop_event.wait(), timeout=self.config.server.reconnect_delay)
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
                     break
                 except asyncio.TimeoutError:
                     pass
@@ -80,11 +135,24 @@ class BLEManager:
 
         self.ctrl = CuktechBLEController(self.mac, self.token)
         await self.ctrl.connect()
+
+        _LOGGER.info("Connected, waiting for device to settle...")
+        await asyncio.sleep(1)
+
         await self.ctrl.read_device_info()
         _LOGGER.info("Connected, authenticating...")
 
         if not await self.ctrl.authenticate():
-            raise ConnectionError("Auth failed")
+            _LOGGER.warning("Auth failed, disconnecting BLE...")
+            try:
+                if self.ctrl.client and self.ctrl.client.is_connected:
+                    await self.ctrl.stop_all_notifications()
+                    await self.ctrl.client.disconnect()
+            except Exception:
+                pass
+            # 等待设备处理断连，避免旧连接未完全释放时新连接冲突
+            await asyncio.sleep(2)
+            raise AuthConnectionError("Auth failed")
 
         await self.state.set_connection(True, True)
         _invalidate()
@@ -96,19 +164,30 @@ class BLEManager:
 
     async def _disconnect(self):
         if self.ctrl:
-            try:
-                client = self.ctrl.client
-                if client and client.is_connected:
-                    try:
-                        await asyncio.wait_for(client.disconnect(), timeout=3.0)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            client = self.ctrl.client if self.ctrl else None
+            was_connected = bool(client and client.is_connected)
+            # 如果已触发 stop，跳过 GATT cleanup（_force_disconnect_bluetooth 会处理）
+            if not self._stop_event.is_set():
+                try:
+                    await self.ctrl.stop_all_notifications()
+                except Exception:
+                    pass
+                try:
+                    if client and client.is_connected:
+                        try:
+                            await asyncio.wait_for(client.disconnect(), timeout=3.0)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             self.ctrl = None
+            if was_connected and not self._stop_event.is_set():
+                _LOGGER.error("BLE device disconnected unexpectedly")
         await self.state.set_connection(False, False)
         _invalidate()
         self._publish_status({"connected": False}, retain=True)
+        # bluetoothctl disconnect MAC 由 _force_disconnect_bluetooth() 统一处理
+        # 此处不再重复调用，避免设备收到多次断连通知导致状态混乱
 
     async def _force_disconnect_bluetooth(self):
         """使用 bluetoothctl 强制断开蓝牙连接并重置适配器"""
@@ -119,8 +198,8 @@ class BLEManager:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await asyncio.wait_for(proc.communicate(), timeout=5)
-        except Exception:
-            pass
+        except Exception as e:
+            _LOGGER.warning("bluetoothctl disconnect failed: %s", e)
         # 重置蓝牙适配器以清理残留状态
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -136,24 +215,60 @@ class BLEManager:
                 stderr=asyncio.subprocess.DEVNULL,
             )
             await asyncio.wait_for(proc.communicate(), timeout=5)
-            await asyncio.sleep(2)
-        except Exception:
-            pass
+            # 等待适配器就绪，最多10秒
+            for _ in range(10):
+                await asyncio.sleep(1)
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "hciconfig", "hci0",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+                    if b"UP" in stdout:
+                        _LOGGER.info("BT adapter ready")
+                        break
+                except Exception:
+                    pass
+            else:
+                _LOGGER.warning("BT adapter not ready after 10s, proceeding anyway")
+        except Exception as e:
+            _LOGGER.warning("bluetoothctl power cycle failed: %s", e)
 
     async def _connect_and_run(self):
         await self._connect()
         last_refresh = time.time()
+        last_notify = time.time()
+        last_keepalive = time.time()
 
         while not self._stop_event.is_set():
             await self._process_commands()
 
             try:
                 data = await asyncio.wait_for(
-                    self.ctrl._wait_notify("cmd_recv", timeout=1.0), timeout=2.0)
+                    self.ctrl.wait_notify("cmd_recv"), timeout=2.0)
+                last_notify = time.time()
             except asyncio.TimeoutError:
-                if time.time() - last_refresh > self.config.server.settings_refresh_interval:
+                now = time.time()
+                if now - last_refresh > self.config.server.settings_refresh_interval:
                     await self._refresh_settings()
-                    last_refresh = time.time()
+                    last_refresh = now
+                if now - last_keepalive > 10:
+                    if self.ctrl and self.ctrl.client and self.ctrl.client.is_connected:
+                        try:
+                            await self.ctrl.client.read_gatt_char(CHAR_FW_VERSION)
+                            last_keepalive = now
+                        except Exception:
+                            pass
+                    else:
+                        if self.ctrl is None or not self.ctrl.client or not self.ctrl.client.is_connected:
+                            if now - last_keepalive > 30:
+                                raise ConnectionError('BLE disconnected via keepalive')
+                if now - last_notify > 60:
+                    client = self.ctrl.client if self.ctrl else None
+                    if not client or not client.is_connected:
+                        _LOGGER.warning("BLE connection lost, triggering reconnect")
+                        raise ConnectionError("BLE disconnected")
                 continue
             except Exception as e:
                 _LOGGER.warning("BLE notification error: %s", e)
@@ -170,7 +285,8 @@ class BLEManager:
     async def _fetch_settings(self, update_existing=False):
         settings = dict(self.state.settings) if update_existing else {}
         pdo_caps = {}
-        for piid in [5, 6, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20]:
+        fail_count = 0
+        for piid in READABLE_SETTINGS_PIIDS:
             try:
                 result = await self.ctrl.send_miot_command(2, piid)
                 if result and "value" in result:
@@ -180,8 +296,11 @@ class BLEManager:
                     elif piid == 18:
                         pdo_caps["c3a"] = decode_pdo_caps(result["value"], "c3", "a")
             except Exception as e:
+                fail_count += 1
                 _LOGGER.debug("Failed to read PIID %d: %s", piid, e)
             await asyncio.sleep(0.1)
+        if fail_count == 14:
+            _LOGGER.warning("All PIID reads failed, BLE channel may be broken")
         await self.state.update_settings(settings)
         await self.state.update_pdo_caps(pdo_caps)
         _invalidate()
@@ -229,7 +348,9 @@ class BLEManager:
         port, action = cmd_data
         try:
             cur = await self.ctrl.send_miot_command(2, 16)
-            cur_val = cur.get("value", 0x0F) if cur else 0x0F
+            cur_val = cur.get("value", 0) if cur else 0
+            if cur is None:
+                _LOGGER.warning('Failed to read port state, using 0')
             if port == "all":
                 new_val = 0x0F if action == "on" else 0x00
             else:
@@ -237,7 +358,7 @@ class BLEManager:
                 new_val = cur_val | (1 << bit) if action == "on" else cur_val & ~(1 << bit)
             if new_val != cur_val:
                 await self.ctrl.send_miot_command(2, 16, value=new_val)
-            await self.state.update_settings({"16": new_val})
+                await self.state.update_settings({"16": new_val})
             _invalidate()
             self._publish_settings(retain=True)
             if cmd_future and not cmd_future.done():
@@ -251,9 +372,13 @@ class BLEManager:
         encrypted_payload = data[4:]
         await self.ctrl.client.write_gatt_char(
             CHAR_CMD_RECV, bytes([0x00, 0x00, 0x03, 0x00]), response=False)
-        pt = self.ctrl._decrypt(encrypted_payload)
+        pt = self.ctrl.decrypt(encrypted_payload)
         if not pt or len(pt) < 8:
+            self._decrypt_failures += 1
+            if self._decrypt_failures >= 10:
+                _LOGGER.warning("Decrypt failed %d times consecutively, session may be stale", self._decrypt_failures)
             return
+        self._decrypt_failures = 0
         b4 = pt[4]
         piid = pt[7] if len(pt) > 7 else -1
         if b4 == 0x04 and piid in PORT_NAMES:
@@ -266,9 +391,14 @@ class BLEManager:
             if port_info:
                 old = self.state.ports.get(piid)
                 await self.state.update_port(piid, port_info)
-                if old != port_info:
+                if old is None or old.to_dict() != port_info:
                     _invalidate()
                     self._publish_port(PORT_NAMES[piid], port_info)
+                    if self._history and port_info.get("active", False):
+                        loop = asyncio.get_running_loop()
+                        task = loop.run_in_executor(None, self._history.record_port_data, piid, port_info)
+                        task.add_done_callback(
+                            lambda t: _LOGGER.error("History write failed: %s", t.exception()) if t.exception() else None)
 
     async def _handle_multiframe(self, data):
         """Handle multi-frame BLE data. Data is ACKed but not processed further.
@@ -278,14 +408,27 @@ class BLEManager:
         Actual data processing happens via inline notifications.
         """
         frame_count = data[4] + 0x100 * data[5]
-        if frame_count > 256:
-            _LOGGER.warning("Multiframe count too large: %d, skipping", frame_count)
+        if frame_count > 1000:
+            _LOGGER.warning("Multiframe count too large: %d, consuming all frames", frame_count)
+            # Still send ACK to keep protocol in sync
+            await self.ctrl.client.write_gatt_char(
+                CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x01]), response=False)
+            # Consume all remaining frames in a tight loop
+            for i in range(frame_count):
+                try:
+                    await asyncio.wait_for(
+                        self.ctrl.wait_notify("cmd_recv", timeout=3.0), timeout=5.0)
+                except (asyncio.TimeoutError, Exception) as e:
+                    _LOGGER.warning("Multiframe drain stopped at frame %d/%d: %s", i+1, frame_count, e)
+                    break
+            await self.ctrl.client.write_gatt_char(
+                CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x00]), response=False)
             return
         await self.ctrl.client.write_gatt_char(
             CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x01]), response=False)
         received_count = 0
         for _ in range(frame_count):
-            frame = await self.ctrl._wait_notify("cmd_recv", timeout=3.0)
+            frame = await self.ctrl.wait_notify("cmd_recv", timeout=3.0)
             if frame:
                 received_count += 1
         await self.ctrl.client.write_gatt_char(
