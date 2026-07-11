@@ -58,6 +58,8 @@ class CuktechBLEController:
         self.authenticated = False
         self._notify_queues = {}
         self._send_it = 0
+        self.device_model: str = ""
+        self.firmware_version: str = ""
         self._miot_seq = 1
         self._session_keys = None
 
@@ -153,10 +155,14 @@ class CuktechBLEController:
                     break
 
         # 提前订阅所有通知通道 (避免 CCCD 订阅延迟导致丢失通知)
-        await self.client.start_notify(CHAR_AUTH_CTRL, self._make_notify_handler("auth_ctrl"))
-        await self.client.start_notify(CHAR_AUTH_DATA, self._make_notify_handler("auth_data"))
-        await self.client.start_notify(CHAR_CMD_SEND, self._make_notify_handler("cmd_send"))
-        await self.client.start_notify(CHAR_CMD_RECV, self._make_notify_handler("cmd_recv"))
+        for char, name in [
+            (CHAR_AUTH_CTRL, "auth_ctrl"), (CHAR_AUTH_DATA, "auth_data"),
+            (CHAR_CMD_SEND, "cmd_send"), (CHAR_CMD_RECV, "cmd_recv"),
+        ]:
+            try:
+                await self.client.start_notify(char, self._make_notify_handler(name))
+            except Exception as e:
+                _LOGGER.warning("Failed to subscribe %s: %s", name, e)
         _LOGGER.info("All notification channels subscribed")
 
         return True
@@ -202,7 +208,7 @@ class CuktechBLEController:
             _LOGGER.info("Disconnected")
 
     async def read_device_info(self):
-        """读取设备信息 (无需认证)。"""
+        """读取设备信息 (无需认证)，存储到 self.device_model / self.firmware_version。"""
         _LOGGER.info("Reading device info...")
 
         # 订阅设备信息通知
@@ -221,14 +227,17 @@ class CuktechBLEController:
         data = await self.wait_notify("dev_info")
         if data and len(data) > 2:
             chip_name = data[2:2 + data[1]].decode("ascii", errors="replace")
-            _LOGGER.info("Chip: %s", chip_name)
+            self.device_model = f"njcuk.fitting.ad1204_{chip_name}"
+            _LOGGER.info("Chip (model): %s -> %s", chip_name, self.device_model)
 
         # 读取固件版本
         try:
             fw_data = await self.client.read_gatt_char(CHAR_FW_VERSION)
             fw_str = fw_data.rstrip(b'\x00').decode("ascii", errors="replace")
+            self.firmware_version = fw_str
             _LOGGER.info("Firmware: %s", fw_str)
         except Exception as e:
+            self.firmware_version = ""
             _LOGGER.warning("Failed to read firmware version: %s", e)
 
         await self.client.stop_notify(CHAR_DEVICE_INFO)
