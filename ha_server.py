@@ -3,6 +3,9 @@
 BLE data is published to MQTT for real-time updates in Home Assistant.
 """
 import asyncio
+import re
+import warnings
+warnings.filterwarnings('ignore', message='.*default MTU.*')
 import gzip
 import hashlib
 import json
@@ -55,6 +58,10 @@ class Server:
             self.mqtt_client.publish(topic, json.dumps(payload, ensure_ascii=False), retain=retain)
 
     def setup_mqtt(self):
+        if not self.config.mqtt.enabled:
+            _LOGGER.info("MQTT disabled, running in standalone web server mode")
+            return
+
         import paho.mqtt.client as mqtt
         self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         if self.config.mqtt.username:
@@ -407,8 +414,13 @@ class Server:
             headers={"Content-Disposition": f"attachment; filename=port_{port}_history.csv"},
         )
 
+    MOBILE_UA = re.compile(r'Android|iPhone|iPod|webOS|BlackBerry|Windows Phone', re.I)
+
     async def handle_index(self, request):
-        return web.FileResponse(WEB_DIR / "index.html")
+        ua = request.headers.get('User-Agent', '')
+        if self.MOBILE_UA.search(ua):
+            return web.FileResponse(WEB_DIR / 'phone.html')
+        return web.FileResponse(WEB_DIR / 'index.html')
 
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -481,6 +493,7 @@ async def cache_middleware(request, handler):
 
 app = web.Application(middlewares=[cors_middleware, gzip_middleware, cache_middleware])
 app.router.add_get("/", lambda r: get_server().handle_index(r))
+app.router.add_get("/phone.html", lambda r: web.FileResponse(WEB_DIR / "phone.html"))
 app.router.add_get("/api/status", lambda r: get_server().handle_status(r))
 app.router.add_post("/api/set", lambda r: get_server().handle_set(r))
 app.router.add_post("/api/port", lambda r: get_server().handle_port(r))
@@ -503,8 +516,6 @@ async def on_startup(app_):
         s.setup_mqtt()
         if s.mqtt_client:
             s.setup_mqtt_subscriptions()
-        else:
-            _LOGGER.warning("MQTT not connected, BLE commands via MQTT will not work")
         app_["ble_task"] = asyncio.create_task(s.ble.start())
 
 
