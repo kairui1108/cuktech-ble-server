@@ -30,12 +30,52 @@ logging.basicConfig(
 _LOGGER = logging.getLogger("cuktech_server")
 
 
+_sse_log = logging.getLogger("cuktech_sse")
+
+
+class SSEEmitter:
+    """SSE event broadcaster — push events to all connected browser clients."""
+
+    MAX_QUEUE_SIZE = 64
+
+    def __init__(self):
+        self._clients: set[asyncio.Queue] = set()
+
+    def add_client(self, queue: asyncio.Queue):
+        self._clients.add(queue)
+        _sse_log.info("SSE client connected (total: %d)", len(self._clients))
+
+    def remove_client(self, queue: asyncio.Queue):
+        self._clients.discard(queue)
+        _sse_log.info("SSE client disconnected (total: %d)", len(self._clients))
+
+    def emit(self, event_type: str, data: dict):
+        """Broadcast event to all connected clients. Non-blocking, drops oldest on full queue."""
+        payload = json.dumps({"type": event_type, **data}, ensure_ascii=False)
+        for q in list(self._clients):
+            try:
+                q.put_nowait(payload)
+            except asyncio.QueueFull:
+                # Drop oldest event to make room for the new one
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    q.put_nowait(payload)
+                except asyncio.QueueFull:
+                    pass
+
+
 class Server:
     def __init__(self):
         self.config = load_config()
         self.state = ChargerState()
         self.ble = BLEManager(self.config.ble.mac, self.config.ble.token, self.state, self.config)
         self.mqtt_client = None
+        self._mqtt_connect_time = 0.0
+        self._mqtt_disconnect_count = 0
+        self._mqtt_publish_failures = 0
         self.loop = None
         self._start_lock = asyncio.Lock()
         self._status_cache_bytes = None
@@ -43,6 +83,7 @@ class Server:
         self._chart_cache = {}
         self._chart_cache_ttl = 10
         self._chart_cache_max = 50
+        self.sse = SSEEmitter()
         self.history = PortHistory(
             db_path=self.config.server.history_db_path,
             retention_days=self.config.server.history_retention_days,
@@ -60,7 +101,10 @@ class Server:
         """Publish to all enabled MQTT clients (multiplex)."""
         # HA MQTT
         if self.mqtt_client and self.mqtt_client.is_connected():
-            self.mqtt_client.publish(topic, json.dumps(payload, ensure_ascii=False), retain=retain)
+            try:
+                self.mqtt_client.publish(topic, json.dumps(payload, ensure_ascii=False), retain=retain)
+            except Exception:
+                self._mqtt_publish_failures += 1
         # Bemfa
         if self.bemfa and self.bemfa.is_connected:
             self._bemfa_publish(topic, payload)
@@ -165,12 +209,14 @@ class Server:
         def on_connect(client, userdata, flags, rc, properties=None):
             _LOGGER.info("MQTT connected (rc=%s)", rc)
             s = get_server()
+            s._mqtt_connect_time = time.time()
             if s.ble:
                 s.ble.set_mqtt_publisher(s.mqtt_publish)
             s.setup_mqtt_subscriptions()
 
         def on_disconnect(client, userdata, flags, rc, properties=None):
             _LOGGER.warning("MQTT disconnected (rc=%s)", rc)
+            get_server()._mqtt_disconnect_count += 1
 
         self.mqtt_client.on_connect = on_connect
         self.mqtt_client.on_disconnect = on_disconnect
@@ -257,6 +303,23 @@ class Server:
 
     def invalidate_status_cache(self):
         self._status_cache_valid = False
+
+    def mqtt_quality(self) -> dict:
+        """Return MQTT connection quality metrics."""
+        if not self.mqtt_client:
+            return {"score": 0, "uptime": 0, "disconnects": 0, "publish_failures": 0}
+        connected = self.mqtt_client.is_connected()
+        if not connected:
+            return {"score": 0, "uptime": 0, "disconnects": self._mqtt_disconnect_count,
+                    "publish_failures": self._mqtt_publish_failures}
+        uptime = int(time.time() - self._mqtt_connect_time) if self._mqtt_connect_time else 0
+        # Disconnect penalty: each disconnect costs 15 points
+        dc_score = max(0, 100 - self._mqtt_disconnect_count * 15)
+        # Publish failure penalty
+        pf_score = max(0, 100 - self._mqtt_publish_failures * 5)
+        score = round(dc_score * 0.6 + pf_score * 0.4)
+        return {"score": score, "uptime": uptime, "disconnects": self._mqtt_disconnect_count,
+                "publish_failures": self._mqtt_publish_failures}
 
     async def handle_status(self, request):
         if self._status_cache_valid and self._status_cache_bytes:
@@ -372,6 +435,9 @@ class Server:
                 # 同步本地状态，确保后续 GET 读到最新值
                 if result and result.get("ok"):
                     await state.update_protocol_extend(new_val)
+                    if hasattr(self, 'sse'):
+                        self.sse.emit("protocol", {"switches": state.protocol_switches,
+                                                    "protocol_extend": new_val})
                 self.invalidate_status_cache()
                 return web.json_response(result)
             else:
@@ -381,6 +447,9 @@ class Server:
             result = await self.ble.send_command("set", (21, new_val))
             if result and result.get("ok"):
                 await state.update_protocol_extend(new_val)
+                if hasattr(self, 'sse'):
+                    self.sse.emit("protocol", {"switches": state.protocol_switches,
+                                                "protocol_extend": new_val})
             return web.json_response(result)
         except Exception as e:
             _LOGGER.error("Protocol switch error: %s", e)
@@ -722,6 +791,46 @@ class Server:
 
         return web.json_response(stats)
 
+    async def handle_sse(self, request):
+        """GET /api/events — Server-Sent Events stream."""
+        response = web.StreamResponse(
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+        response.content_type = "text/event-stream"
+        await response.prepare(request)
+
+        queue: asyncio.Queue = asyncio.Queue(maxsize=SSEEmitter.MAX_QUEUE_SIZE)
+        self.sse.add_client(queue)
+
+        # Send full state on connect so client can initialize
+        try:
+            full_state = await self.state.to_dict()
+            full_state["type"] = "init"
+            full_state["mqtt_connected"] = self.mqtt_client is not None and self.mqtt_client.is_connected()
+            await response.write(
+                f"data: {json.dumps(full_state, ensure_ascii=False)}\n\n".encode()
+            )
+        except Exception as e:
+            _sse_log.error("Failed to send SSE init event: %s", e)
+
+        try:
+            while True:
+                # Keepalive every 15s + event wait
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    await response.write(f"data: {msg}\n\n".encode())
+                except asyncio.TimeoutError:
+                    await response.write(b": keepalive\n\n")
+        except (asyncio.CancelledError, ConnectionResetError, ConnectionError, BrokenPipeError):
+            pass
+        finally:
+            self.sse.remove_client(queue)
+        return response
+
 
 WEB_DIR = Path(__file__).parent / "web"
 _server = None
@@ -808,6 +917,7 @@ app.router.add_get("/api/bemfa", lambda r: get_server().handle_bemfa(r))
 app.router.add_get("/api/sessions", lambda r: get_server().handle_sessions(r))
 app.router.add_get("/api/sessions/{id}/points", lambda r: get_server().handle_session_points(r))
 app.router.add_get("/api/energy/stats", lambda r: get_server().handle_energy_stats(r))
+app.router.add_get("/api/events", lambda r: get_server().handle_sse(r))
 app.router.add_static("/static", WEB_DIR / "static", show_index=False)
 
 
@@ -816,6 +926,12 @@ async def on_startup(app_):
     async with s._start_lock:
         s.loop = asyncio.get_running_loop()
         set_status_cache_invalidator(s.invalidate_status_cache)
+        s.ble.set_sse_emitter(s.sse)
+        s.ble.set_quality_provider(lambda: {
+            "ble": s.ble.connection_quality(),
+            "mqtt": s.mqtt_quality(),
+            "bemfa": s.bemfa.quality() if s.bemfa else {"score": 0, "uptime": 0, "ping_lost": 0, "reconnect_count": 0},
+        })
         s.history.connect()
         s.ble.set_history(s.history)
         await s.setup_mqtt()

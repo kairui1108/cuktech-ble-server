@@ -8,7 +8,8 @@ Standalone BLE server for connecting CUKTECH chargers and pushing real-time data
 
 - **BLE Connection & MiOT Auth**: Auto-connect charger with reconnection support
 - **BLE Stability**: LL disconnect confirmation, GATT ready wait, exponential backoff
-- **Real-time Data**: MQTT publish voltage, current, power, protocol per port
+- **Real-time Data**: SSE event stream pushes port data and status to Web frontend; MQTT push to HA
+- **SSE Event Stream**: Server-Sent Events push real-time port updates, status changes, and setting changes — replaces 2s polling
 - **Protocol Detection**: Auto-detect PD / PD Fixed / PD PPS / QC / USB-A
 - **Web UI**: Real-time charts, port control, settings, Bemfa toggle, 6 themes
 - **HTTP API**: RESTful endpoints for external systems
@@ -164,6 +165,7 @@ cp config.yaml.example config.yaml
 
 Access at `http://<SERVER_IP>:8199/`
 
+- **SSE real-time push**: Port data and status updates delivered via SSE event stream — no polling needed
 - Real-time power charts (Chart.js)
 - Port control (C1/C2/C3/A)
 - Device settings
@@ -184,6 +186,7 @@ Access at `http://<SERVER_IP>:8199/`
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
+| `/api/events` | GET | SSE event stream (port data, status, settings) |
 | `/api/status` | GET | Full charger status |
 | `/api/enable` | POST | Enable/disable BLE `{"enabled": true/false}` |
 | `/api/set` | POST | Set PIID value `{"piid": N, "value": V}` |
@@ -204,7 +207,7 @@ Access at `http://<SERVER_IP>:8199/`
 ## Known Limitations
 
 - **Single Device**: Current architecture supports only one charger at a time. Multi-device support is planned for future releases.
-- **Protocol Detection**: Charging protocol identification (PD/QC/USB-A etc.) is inferred from port voltage and PDO data, and may not always match the actual protocol.
+- **Protocol Detection**: Hardware protocol codes (PIID 17/18) are consistent with the Xiaomi Home app, refreshed every ~60s — protocol changes during the interval may appear delayed; falls back to heuristic inference when hardware codes are unavailable
 - **Platform Support**: Development and testing are done exclusively on Linux. Compatibility with other platforms (macOS, Windows) has not been verified — use at your own risk.
 
 ## Protocol Support
