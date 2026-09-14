@@ -787,6 +787,7 @@ class BLEManager:
     async def _connect_and_run(self):
         await self._connect()
         self._keepalive_fails = 0
+        self._settings_fail_streak = 0
         last_refresh = time.time()
         last_notify = time.time()
         last_keepalive = time.time()
@@ -817,6 +818,21 @@ class BLEManager:
                         now = time.time()
                         last_refresh = now
                         last_notify = now
+                        # Zombie-channel guard: _fetch_settings only logs when every
+                        # readable PIID fails, it never forces a reconnect on its own.
+                        # If that happens repeatedly in a row, the BLE transport is
+                        # alive (no disconnect callback fires) but GATT reads are
+                        # dead (observed as e.g. "Service Discovery has not been
+                        # performed yet") -- force a reconnect the same way the
+                        # keepalive-failure path already does below.
+                        if getattr(self, "_settings_fail_streak", 0) >= 2:
+                            _LOGGER.warning(
+                                "Settings refresh failed %d times in a row "
+                                "(all PIID reads failing) -- BLE channel is a "
+                                "zombie, forcing reconnect",
+                                self._settings_fail_streak)
+                            raise ConnectionError(
+                                "BLE channel stale: repeated full PIID read failure")
                     if now - last_keepalive > 10:
                         if self.ctrl and self.ctrl.client and self.ctrl.client.is_connected:
                             try:
@@ -972,7 +988,12 @@ class BLEManager:
                 fail_count += 1
                 _LOGGER.debug("Failed to read PIID %d: %s", piid, e)
         if fail_count >= len(READABLE_SETTINGS_PIIDS):
-            _LOGGER.warning("All %d PIID reads failed, BLE channel may be broken", fail_count)
+            self._settings_fail_streak = getattr(self, "_settings_fail_streak", 0) + 1
+            _LOGGER.warning(
+                "All %d PIID reads failed, BLE channel may be broken (streak=%d)",
+                fail_count, self._settings_fail_streak)
+        else:
+            self._settings_fail_streak = 0
         await self.state.update_settings(settings)
         await self.state.update_pdo_caps(pdo_caps)
         _invalidate()
