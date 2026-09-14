@@ -905,51 +905,54 @@ class BLEManager:
             now = time.time()
             loop = asyncio.get_running_loop()
             for piid in range(1, 5):
-                ps = self.state.ports.get(piid)
-                if not ps or (ps.voltage <= 0 and ps.current <= 0):
-                    continue
-                es = self._energy_states[piid]
-                # BLE handler already recorded if last_time < 2s ago
-                idle = es.last_time is None or (now - es.last_time > 2)
-                # Active verification: if the port has been idle (no BLE push)
-                # longer than IDLE_VERIFY_SEC, enqueue a GET so the main loop
-                # actively re-samples it. This catches the case where the unplug
-                # push was lost (we were busy in an active GET) and ps stays at
-                # the stale pre-unplug V/I forever.
-                if (idle and es.last_time is not None
-                        and now - es.last_time > self._IDLE_VERIFY_SEC
-                        and now - self._last_verify_time[piid] > self._IDLE_VERIFY_SEC
-                        and piid not in self._pending_verify):
-                    self._pending_verify.add(piid)
-                    try:
-                        self.cmd_queue.put_nowait(("verify_port", piid, None))
-                        self._last_verify_time[piid] = now
-                    except asyncio.QueueFull:
-                        self._pending_verify.discard(piid)
-                if idle:
-                    # Only integrate if current > 0 (no power transfer at 0A)
-                    if es.is_charging and ps.current > 0:
-                        self._energy_integrator.update(
-                            es, ps.voltage, ps.current, now)
-                        det = self._charge_detectors[piid]
-                        det.update(ps.voltage * ps.current, now)
-                        # Check if session should end (gradual power decline)
-                        if det.should_end_session(es, now):
-                            self._low_current_count[piid] = 0
-                            sid = self._close_session(piid, now, ps.voltage, ps.current)
-                            if sid and sid > 0:
-                                _LOGGER.info("Timer ended session %d (port %d, %.1fWh)",
-                                             sid, piid, es.session_wh)
-                        else:
-                            # 仅真实会话（正 sid）且记录开启时写入采样点
-                            self._record_charge_point(
-                                piid, ps.voltage, ps.current, ps.protocol or "")
-                    # port_history: always write for chart continuity
-                    task = loop.run_in_executor(
-                        None, self._history.record_port_data,
-                        piid, ps.to_dict())
-                    task.add_done_callback(
-                        lambda t: _LOGGER.error("Timer record_port_data failed: %s", t.exception()) if t.exception() else None)
+                try:
+                    ps = self.state.ports.get(piid)
+                    if not ps or (ps.voltage <= 0 and ps.current <= 0):
+                        continue
+                    es = self._energy_states[piid]
+                    # BLE handler already recorded if last_time < 2s ago
+                    idle = es.last_time is None or (now - es.last_time > 2)
+                    # Active verification: if the port has been idle (no BLE push)
+                    # longer than IDLE_VERIFY_SEC, enqueue a GET so the main loop
+                    # actively re-samples it. This catches the case where the unplug
+                    # push was lost (we were busy in an active GET) and ps stays at
+                    # the stale pre-unplug V/I forever.
+                    if (idle and es.last_time is not None
+                            and now - es.last_time > self._IDLE_VERIFY_SEC
+                            and now - self._last_verify_time[piid] > self._IDLE_VERIFY_SEC
+                            and piid not in self._pending_verify):
+                        self._pending_verify.add(piid)
+                        try:
+                            self.cmd_queue.put_nowait(("verify_port", piid, None))
+                            self._last_verify_time[piid] = now
+                        except asyncio.QueueFull:
+                            self._pending_verify.discard(piid)
+                    if idle:
+                        # Only integrate if current > 0 (no power transfer at 0A)
+                        if es.is_charging and ps.current > 0:
+                            self._energy_integrator.update(
+                                es, ps.voltage, ps.current, now)
+                            det = self._charge_detectors[piid]
+                            det.update(ps.voltage * ps.current, now)
+                            # Check if session should end (gradual power decline)
+                            if det.should_end_session(es, now):
+                                self._low_current_count[piid] = 0
+                                sid = self._close_session(piid, now, ps.voltage, ps.current)
+                                if sid and sid > 0:
+                                    _LOGGER.info("Timer ended session %d (port %d, %.1fWh)",
+                                                 sid, piid, es.session_wh)
+                            else:
+                                # 仅真实会话（正 sid）且记录开启时写入采样点
+                                self._record_charge_point(
+                                    piid, ps.voltage, ps.current, ps.protocol or "")
+                        # port_history: always write for chart continuity
+                        task = loop.run_in_executor(
+                            None, self._history.record_port_data,
+                            piid, ps.to_dict())
+                        task.add_done_callback(
+                            lambda t: _LOGGER.error("Timer record_port_data failed: %s", t.exception()) if t.exception() else None)
+                except Exception as e:
+                    _LOGGER.error("Port timer error for piid %d: %s", piid, e, exc_info=True)
 
     async def _fetch_settings(self, update_existing=False):
         settings = dict(self.state.settings) if update_existing else {}
