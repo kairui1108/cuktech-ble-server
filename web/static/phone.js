@@ -1,6 +1,11 @@
 // ── API & Config ──
 const API_BASE = window.location.origin;
 
+// SSE 连接句柄：必须声明在文件顶部——initPhoneSSE() 在末尾的 Init 段就会被调用，
+// 声明写在函数旁边会落进 TDZ（Cannot access before initialization）。
+// 放全局还有一个原因：页面的 bfcache 处理器要能关掉它并置空（见 initPhoneSSE）。
+let phoneEvtSource = null;
+
 // Localized scene names/descriptions (keys into the i18n resource packs)
 function sceneName(mode) { return I18N.t('scene.' + ({ 1: 'ai', 2: 'eco', 3: 'single', 4: 'balanced' }[mode] || 'ai')); }
 function sceneDesc(mode) { return I18N.t('scene.desc' + ({ 1: 'Ai', 2: 'Eco', 3: 'Single', 4: 'Balanced' }[mode] || 'Ai')); }
@@ -204,6 +209,7 @@ function renderAll() {
     renderRateCard();
     renderCharts();
     renderPowerDist();
+    renderChargeLimit();
     renderDelayOff();
     renderSettingsUI();
     renderProtocolSwitches();
@@ -487,6 +493,288 @@ function renderPowerDist() {
     }).join('');
 }
 
+// ── Charge Limit (充到指定 Wh 自动关断) ──
+// 数据契约/请求形状/交互语义由 charge_limit.js 统一提供，见该文件头部说明。
+// 配色走 phone.css 的 .charge-limit-* 类（--limit-* 变量随 body.light 切换）；
+// 不要把 PORT_COLORS 内联进 style——内联优先级高于样式表且不随主题变化。
+//
+// 手机端把 4 个端口叠成一沓卡：只有栈顶那张完整可见，其余按 depth 逐层下移并
+// 收窄，只露出底部一条边；左右滑动或点下方指示点切换。整卡高度因此从 4 份降到
+// 1 份（约 -70%），这是这次改版的目的。栈序存在 limitOrder 里，[0] 为栈顶。
+let chargeLimitRendered = false;
+let limitOrder = PORT_KEYS.slice();
+let limitFlipBusy = false;   // 翻页动画期间忽略新手势，避免状态错位
+let limitDrag = null;
+let limitSuppressClick = false;   // 刚划过卡：吃掉紧随其后的 click
+
+function limitCardEl(key) { return document.getElementById('limitCard_' + key); }
+
+function limitCardHtml(key, CL) {
+    return `<div class="charge-limit-card ${key}" id="limitCard_${key}">
+                <div class="charge-limit-head">
+                    <div class="charge-limit-title">
+                        <div class="charge-limit-dot"></div>
+                        <span class="charge-limit-name">${PORT_NAMES[key]}</span>
+                    </div>
+                    <span class="charge-limit-status" id="limitStatus_${key}">${I18N.t('chargeLimit.off')}</span>
+                </div>
+                <div class="charge-limit-track"><div class="charge-limit-fill" id="limitBar_${key}"></div></div>
+                <div class="charge-limit-progress" id="limitProgress_${key}"></div>
+                <div class="charge-limit-inputs">
+                    <input type="number" class="charge-limit-wh" id="limitWh_${key}" min="0" max="1000" step="1" placeholder="${I18N.t('chargeLimit.placeholder')}">
+                    <select class="charge-limit-mode" id="limitMode_${key}">
+                        <option value="once">${I18N.t('chargeLimit.once')}</option>
+                        <option value="always">${I18N.t('chargeLimit.always')}</option>
+                    </select>
+                </div>
+                <div class="charge-limit-quick">
+                    ${CL.QUICK_WH.map(w => `<button class="charge-limit-chip" onclick="setChargeLimitQuick('${key}', ${w})">${w}${I18N.t('chargeLimit.unit')}</button>`).join('')}
+                </div>
+                <div class="charge-limit-actions">
+                    <button class="charge-limit-action charge-limit-set" id="limitSet_${key}" onclick="applyChargeLimit('${key}')">${I18N.t('chargeLimit.set')}</button>
+                    <button class="charge-limit-action charge-limit-clear" id="limitClear_${key}" onclick="clearChargeLimit('${key}')">${I18N.t('chargeLimit.clear')}</button>
+                </div>
+            </div>`;
+}
+
+// 指示点：aria-label 带上端口名与当前状态，不滑动也能被读屏读到各端口状态。
+function limitDotHtml(key, CL) {
+    return `<button type="button" class="charge-limit-dotnav ${key}" id="limitDot_${key}"
+                    onclick="showChargeLimitPort('${key}')" aria-label="${PORT_NAMES[key]} ${CL.statusText(key)}"></button>`;
+}
+
+function renderChargeLimit() {
+    const deck = document.getElementById('chargeLimitDeck');
+    if (!deck || typeof ChargeLimit === 'undefined') return;
+    const CL = ChargeLimit;
+
+    if (!chargeLimitRendered) {
+        const dots = document.getElementById('chargeLimitDots');
+        deck.innerHTML = PORT_KEYS.map(k => limitCardHtml(k, CL)).join('');
+        if (dots) dots.innerHTML = PORT_KEYS.map(k => limitDotHtml(k, CL)).join('');
+        bindLimitGesture();
+        chargeLimitRendered = true;
+    }
+    layoutLimitDeck();
+    releaseLimitDeckIntro();   // --depth 刚落盘，首帧不该播"入场动画"
+    updateChargeLimitUI();
+}
+
+// 把栈序写进 DOM：depth 决定下移量与收窄量（真正的位置/尺寸在 phone.css 里）。
+function layoutLimitDeck() {
+    const deck = document.getElementById('chargeLimitDeck');
+    if (deck && deck.style && typeof deck.style.setProperty === 'function') {
+        deck.style.setProperty('--limit-count', String(limitOrder.length));
+    }
+    for (const key of PORT_KEYS) {
+        const el = limitCardEl(key);
+        if (!el) continue;
+        const depth = limitOrder.indexOf(key);
+        if (el.style && typeof el.style.setProperty === 'function') {
+            el.style.setProperty('--depth', String(depth < 0 ? PORT_KEYS.length : depth));
+        }
+        el.style.zIndex = String(20 - depth);
+        // 下层卡被上层完全盖住、只剩一条边，键盘和读屏不该停在看不见的控件上。
+        // inert 不支持时就什么都不设：宁可让它们可聚焦，也不要 aria-hidden 盖住
+        // 仍可聚焦的元素（那是明确的 ARIA 违规）。
+        if ('inert' in el) {
+            el.inert = depth !== 0;
+            el.setAttribute('aria-hidden', depth !== 0 ? 'true' : 'false');
+        }
+    }
+}
+
+// 首帧不播动画：--depth 是渲染后才写上去的，不关掉过渡会让 4 张卡在页面加载时
+// 当着用户的面"滑"一遍。带 .no-anim 强制一次回流后再摘掉即可。
+function releaseLimitDeckIntro() {
+    const deck = document.getElementById('chargeLimitDeck');
+    if (!deck || !deck.classList || typeof deck.classList.contains !== 'function') return;
+    if (!deck.classList.contains('no-anim')) return;
+    void deck.offsetWidth;
+    deck.classList.remove('no-anim');
+}
+
+// ── 翻页 ──
+
+// steps: 正数向后翻。outX: 被换下那张飞出的方向（-1 左 / +1 右）。
+function flipLimitDeck(steps, outX) {
+    const el = limitCardEl(limitOrder[0]);
+    limitOrder = ChargeLimit.flipOrder(limitOrder, steps);
+    limitFlipBusy = true;
+    if (el) {
+        el.style.transition = '';   // 恢复样式表里的过渡
+        el.style.transform = 'translate(' + outX * 118 + '%, 0)';
+        el.style.opacity = '0';
+    }
+    layoutLimitDeck();              // 其余卡片各自前进一格（带过渡）
+    updateChargeLimitUI();
+    setTimeout(function () {
+        if (el) {
+            // 让飞出的那张无声地落回牌堆末位：先关过渡再改位，否则看得见它飞回来
+            el.style.transition = 'none';
+            el.style.transform = '';
+            el.style.opacity = '';
+            void el.offsetWidth;
+            el.style.transition = '';
+        }
+        limitFlipBusy = false;
+    }, 320);
+}
+
+// 点指示点直接跳到某个端口。取步数较短的那个方向转，动画方向才跟手感一致。
+function showChargeLimitPort(key) {
+    if (limitFlipBusy || limitDrag) return;
+    const n = PORT_KEYS.length;
+    const from = limitOrder.indexOf(key);
+    if (from <= 0) return;
+    const steps = from <= n - from ? from : from - n;
+    flipLimitDeck(steps, steps > 0 ? -1 : 1);
+}
+
+function bindLimitGesture() {
+    const deck = document.getElementById('chargeLimitDeck');
+    if (!deck || typeof deck.addEventListener !== 'function') return;
+    deck.addEventListener('pointerdown', onLimitPointerDown);
+    deck.addEventListener('pointermove', onLimitPointerMove);
+    deck.addEventListener('pointerup', onLimitPointerUp);
+    deck.addEventListener('pointercancel', onLimitPointerUp);
+    // 捕获阶段拦下划卡末尾的那次 click：手势可以从快捷值按钮上起手，否则
+    // "想翻页"会顺手把限额设成滑过的那一档。
+    deck.addEventListener('click', onLimitDeckClick, true);
+}
+
+function onLimitDeckClick(e) {
+    if (!limitSuppressClick) return;
+    limitSuppressClick = false;
+    e.stopPropagation();
+    if (e.preventDefault) e.preventDefault();
+}
+
+function onLimitPointerDown(e) {
+    if (limitFlipBusy || limitDrag) return;
+    limitSuppressClick = false;
+    // 输入框/下拉里的按下是原生编辑操作，不参与翻页
+    const tag = e.target && e.target.tagName ? String(e.target.tagName).toUpperCase() : '';
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || tag === 'OPTION') return;
+    const el = limitCardEl(limitOrder[0]);
+    if (!el) return;
+    limitDrag = { id: e.pointerId, x0: e.clientX, y0: e.clientY, dx: 0, moved: false, el: el };
+}
+
+function onLimitPointerMove(e) {
+    const d = limitDrag;
+    if (!d || e.pointerId !== d.id) return;
+    const dx = e.clientX - d.x0;
+    const dy = e.clientY - d.y0;
+    if (!d.moved) {
+        if (Math.abs(dx) < 8) return;
+        // 纵向为主的手势交还给页面滚动（touch-action: pan-y 已放行纵向）
+        if (Math.abs(dx) <= Math.abs(dy)) { limitDrag = null; return; }
+        d.moved = true;
+        d.el.style.transition = 'none';   // 跟手期间不能有过渡
+        const deck = document.getElementById('chargeLimitDeck');
+        if (deck && deck.setPointerCapture) {
+            try { deck.setPointerCapture(e.pointerId); } catch (err) { /* 指针已失效，忽略 */ }
+        }
+    }
+    d.dx = dx;
+    d.el.style.transform = 'translate(' + dx + 'px, 0)';
+    d.el.style.opacity = String(Math.max(0.4, 1 - Math.abs(dx) / 420));   // 渐隐，露出下一张
+}
+
+function onLimitPointerUp(e) {
+    const d = limitDrag;
+    if (!d || e.pointerId !== d.id) return;
+    limitDrag = null;
+    if (!d.moved) return;             // 只是点了下按钮，交给原生 click
+    // 抖动不等于划卡：只有位移明显时才吃掉紧随其后的 click。设限额是这张卡的
+    // 主操作，要是连"手指抖了 10px"的点击也一起吞掉，用户会以为没点上。
+    if (Math.abs(d.dx) > ChargeLimit.SWIPE_MIN_PX / 2) {
+        limitSuppressClick = true;
+        // 400ms 兜底：万一没有 click 跟上来，也不会一直吞掉后续的键盘激活
+        setTimeout(function () { limitSuppressClick = false; }, 400);
+    }
+    d.el.style.transition = '';
+    // 被系统打断（pointercancel，例如浏览器接管了滚动）一律回弹，不做翻页判断
+    const dir = e.type === 'pointercancel'
+        ? 0
+        : ChargeLimit.swipeDecision(d.dx, Number(d.el.offsetWidth) || 320);
+    if (!dir) {                       // 没过阈值：回弹
+        d.el.style.transform = '';
+        d.el.style.opacity = '';
+        return;
+    }
+    flipLimitDeck(dir, dir > 0 ? -1 : 1);
+}
+
+function updateChargeLimitUI() {
+    if (typeof ChargeLimit === 'undefined') return;
+    const CL = ChargeLimit;
+    for (const key of PORT_KEYS) {
+        const e = CL.entryFor(key);
+        const statusEl = document.getElementById(`limitStatus_${key}`);
+        if (statusEl) {
+            statusEl.textContent = CL.statusText(key);
+            // 已设限额时用端口色（.on 由 CSS 取变量，同样跟随主题）
+            statusEl.classList.toggle('on', e.wh > 0);
+        }
+        const barEl = document.getElementById(`limitBar_${key}`);
+        if (barEl) barEl.style.width = CL.progressPct(key) + '%';
+        const progEl = document.getElementById(`limitProgress_${key}`);
+        if (progEl) progEl.textContent = CL.progressText(key);
+        // 不覆盖正在编辑的输入框
+        const inputEl = document.getElementById(`limitWh_${key}`);
+        if (inputEl && document.activeElement !== inputEl) {
+            inputEl.value = e.wh > 0 ? e.wh : '';
+        }
+        const modeEl = document.getElementById(`limitMode_${key}`);
+        if (modeEl && !modeEl.dataset.touched) modeEl.value = e.mode || 'once';
+        // 指示点：空心/实心/警示色 + 当前项拉长，见 phone.css 注释
+        const dotEl = document.getElementById(`limitDot_${key}`);
+        if (dotEl) {
+            const set = e.wh > 0;
+            dotEl.classList.toggle('is-set', set);
+            dotEl.classList.toggle('is-fired', set && !!e.fired);
+            dotEl.classList.toggle('is-current', limitOrder[0] === key);
+            dotEl.setAttribute('aria-current', limitOrder[0] === key ? 'true' : 'false');
+            dotEl.setAttribute('aria-label', PORT_NAMES[key] + ' ' + CL.statusText(key));
+        }
+    }
+}
+
+async function refreshChargeLimit() {
+    if (typeof ChargeLimit === 'undefined') return;
+    await ChargeLimit.fetchLimits();
+    updateChargeLimitUI();
+}
+
+function setChargeLimitQuick(key, wh) {
+    const input = document.getElementById(`limitWh_${key}`);
+    if (input) input.value = wh;
+    applyChargeLimit(key);
+}
+
+async function applyChargeLimit(key) {
+    const input = document.getElementById(`limitWh_${key}`);
+    const modeEl = document.getElementById(`limitMode_${key}`);
+    const wh = ChargeLimit.parseWhInput(input ? input.value : '');
+    if (wh === null) { toast(I18N.t('chargeLimit.saveFailed', { msg: I18N.t('chargeLimit.placeholder') })); return; }
+    if (modeEl) modeEl.dataset.touched = '1';
+    const res = await ChargeLimit.saveLimit(key, wh, modeEl ? modeEl.value : null);
+    if (modeEl) modeEl.dataset.touched = '';
+    toast(res.ok
+        ? (wh > 0 ? I18N.t('chargeLimit.saved') : I18N.t('chargeLimit.cleared'))
+        : I18N.t('chargeLimit.saveFailed', { msg: res.error }));
+    updateChargeLimitUI();
+}
+
+async function clearChargeLimit(key) {
+    const res = await ChargeLimit.saveLimit(key, 0, null);
+    toast(res.ok ? I18N.t('chargeLimit.cleared')
+                 : I18N.t('chargeLimit.saveFailed', { msg: res.error }));
+    updateChargeLimitUI();
+}
+
 // ── Delay Off ──
 const delayMinutes = { c1: 0, c2: 0, c3: 0, a: 0 };
 const DELAY_PIIDS = { c1: 9, c2: 10, c3: 11, a: 12 };
@@ -585,19 +873,58 @@ const phone = document.querySelector('.phone');
 if (phone) phone.addEventListener('scroll', () => handleFade(phone.scrollTop));
 window.addEventListener('scroll', () => handleFade(window.scrollY));
 
-// ── Theme Toggle ──
-let isDark = true;
-function toggleTheme() {
-    isDark = !isDark;
-    document.body.classList.toggle('light', !isDark);
+// ── Theme ──
+// 主题必须持久化：原来只有一个内存变量 isDark = true，刷新页面必然回到深色。
+// 存储键与桌面页共用（cuktech-theme：system / ha-dark / light），
+// 所以手机与桌面看到的是同一个选择；system 表示跟随系统。
+const PHONE_THEME_KEY = 'cuktech-theme';
+
+function storedThemeDark() {
+    let pref = 'system';
+    try { pref = localStorage.getItem(PHONE_THEME_KEY) || 'system'; } catch (e) { /* 隐私模式 */ }
+    if (pref === 'light') return false;
+    if (pref === 'ha-dark') return true;
+    try { return !window.matchMedia || window.matchMedia('(prefers-color-scheme: dark)').matches; } catch (e) { return true; }
+}
+
+// phone.html 顶部那段内联脚本会先把 class 打上（避免闪一下深色），
+// 这里沿用它的结论；脚本没跑到就按存储值自己再算一遍。
+let isDark = (typeof window.__phoneThemeResolved === 'boolean')
+    ? window.__phoneThemeResolved
+    : storedThemeDark();
+
+function applyPhoneTheme(dark, rerender) {
+    isDark = dark;
+    document.body.classList.toggle('light', !dark);
+    // 顺带给 <html> 打标记：charge_history.js 的图表标注线按这个属性判主题
+    document.documentElement.setAttribute('data-appearance', dark ? 'dark' : 'light');
     const deviceImg = document.getElementById('deviceImg');
     if (deviceImg) {
-        deviceImg.src = isDark ? 'static/plugin_imgs/main_charger_dark_ad1204_all.png' : 'static/plugin_imgs/main_charger_light_ad1204_all.png';
+        deviceImg.src = dark
+            ? 'static/plugin_imgs/main_charger_dark_ad1204_all.png'
+            : 'static/plugin_imgs/main_charger_light_ad1204_all.png';
     }
-    document.getElementById('themeBtn').textContent = isDark ? '☀️' : '🌙';
+    const btn = document.getElementById('themeBtn');
+    if (btn) btn.textContent = dark ? '☀️' : '🌙';
     renderSceneCard();
-    renderCharts();
+    // 初始化时图表还没建（紧随其后的 renderAll() 会画），只在手动切换时重绘
+    if (rerender) renderCharts();
 }
+
+function toggleTheme() {
+    const dark = !isDark;
+    try { localStorage.setItem(PHONE_THEME_KEY, dark ? 'ha-dark' : 'light'); } catch (e) { /* 隐私模式 */ }
+    applyPhoneTheme(dark, true);
+}
+
+// 存的是"跟随系统"时，系统外观变了要实时跟（与桌面页同一行为）
+try {
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+        let pref = 'system';
+        try { pref = localStorage.getItem(PHONE_THEME_KEY) || 'system'; } catch (e) { /* 忽略 */ }
+        if (pref !== 'light' && pref !== 'ha-dark') applyPhoneTheme(storedThemeDark(), true);
+    });
+} catch (e) { /* 老浏览器只有 addListener，刷新后仍会解析到正确外观 */ }
 
 // ── 数据推送（仅定时器调用，避免去抖与定时器重复写入） ──
 function phonePushData() {
@@ -621,6 +948,8 @@ function phonePushData() {
 }
 
 // ── Init ──
+// 先把持久化的主题落到设备图 / 场景图标 / 主题按钮上，再走常规渲染
+applyPhoneTheme(isDark, false);
 renderAll();
 initPhoneSSE();
 // 定时器：先 push 数据再渲染（去抖只渲染不 push，杜绝重复点）
@@ -652,8 +981,12 @@ setInterval(async () => {
 }, 30000);
 
 // ── SSE (Server-Sent Events) ──
+// 句柄 phoneEvtSource 声明在文件顶部。原来它是本函数的 const，而 pagehide 处理器里写
+// `evtSource = null`：每次进 bfcache 都抛 TypeError（Assignment to constant variable），
+// 并且因为没能置空，pageshow 又新建一条连接 —— 来回切换会累积 SSE 连接与监听器。
 function initPhoneSSE() {
-    const evtSource = new EventSource(`${API_BASE}/api/events`);
+    if (phoneEvtSource) { phoneEvtSource.close(); phoneEvtSource = null; }
+    const evtSource = phoneEvtSource = new EventSource(`${API_BASE}/api/events`);
     evtSource.onopen = () => {
         document.getElementById('connectDot').style.background = '#34C759';
         // SSE init event handles state sync; no fetchStatus needed
@@ -720,10 +1053,15 @@ function initPhoneSSE() {
     evtSource.onerror = () => {
         document.getElementById('connectDot').style.background = '#666';
     };
-    // bfcache: close on leave, reopen on return
-    window.addEventListener('pagehide', () => { if (evtSource) { evtSource.close(); evtSource = null; } });
-    window.addEventListener('pageshow', () => { if (typeof initPhoneSSE === 'function') initPhoneSSE(); });
 }
+
+// bfcache: close on leave, reopen on return（只注册一次，见文件末尾的 Init 段）
+window.addEventListener('pagehide', () => {
+    if (phoneEvtSource) { phoneEvtSource.close(); phoneEvtSource = null; }
+});
+window.addEventListener('pageshow', () => {
+    if (!phoneEvtSource && typeof initPhoneSSE === 'function') initPhoneSSE();
+});
 
 function applyFullStatus(data) {
     state.bleConnected = data.connected && data.authenticated;
@@ -792,10 +1130,15 @@ if (typeof startChargeHistoryAutoRefresh === 'function') {
     startChargeHistoryAutoRefresh('chargeSessionList', 'chargeStats', 'today', 2000);
 }
 
+// ── Charge Limit: 初次加载 + 进度轮询（本会话已充 Wh 不在 /api/status 里） ──
+refreshChargeLimit();
+setInterval(refreshChargeLimit, 5000);
+
 // ── Locale change: re-render all dynamic content ──
 if (typeof I18N !== 'undefined' && typeof I18N.onChange === 'function') {
     I18N.onChange(function () {
         updateConnectionUI();
+        chargeLimitRendered = false;   // 卡片文案（含 once/always 选项）需重建
         renderAll();
     });
 }
