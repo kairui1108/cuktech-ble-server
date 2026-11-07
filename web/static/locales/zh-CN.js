@@ -13,6 +13,8 @@
             disconnect: '断开设备',
             restart: '重启',
             close: '关闭',
+            confirm: '确定',
+            back: '返回',
             cancel: '取消',
             set: '设置',
             clear: '清除',
@@ -199,6 +201,7 @@
             avgPower: '平均功率 W',
             peakPower: '峰值功率 W',
             noRecords: '暂无充电记录',
+            inProgress: '进行中',
             energy: '电量：{{wh}}Wh',
             powerTooltip: '功率: {{power}}W',
             protocolTooltip: '协议: {{protocol}}',
@@ -225,6 +228,7 @@
         energy: {
             title: '用电统计',
             tabPorts: '按端口',
+            tabShare: '占比',
             tabHourly: '每小时',
             tabProtocols: '快充协议',
             total: '{{period}} · 合计 {{wh}} Wh',
@@ -254,6 +258,17 @@
         // ── Config page ──
         config: {
             title: '系统配置',
+            // ── 重新设计后的分节目录与分节说明（config.html 用）──
+            railTitle: '配置目录',
+            mqttSectionHint: 'Home Assistant 的 MQTT Broker 地址与凭据',
+            bemfaSectionHint: '把小爱 / 小度能说的语音开关映射到端口',
+            serverSectionHint: 'Web 端口、界面语言、日志与数据保留',
+            statusHint: '保存后服务会自动重启，新配置随即生效',
+            saveIdle: '修改后点保存生效',
+            unsaved: '有未保存的改动',
+            saved: '已保存',
+            statusDevicesCount: '{{n}} 台充电器',
+            statusPrimary: '主设备 {{name}}',
             xiaomiAuto: '小米云自动获取',
             mac: 'MAC 地址',
             macHint: '充电器蓝牙 MAC 地址',
@@ -297,7 +312,8 @@
             bemfaPortC3: 'C口3',
             bemfaPortA: 'USB-A',
             bemfaPortBle: '蓝牙开关',
-            bleStatusName: '蓝牙状态名称',
+            bleStatusName: '巴法云实体 ID',
+            bleStatusHint: '留空自动派生（设备 ID + _ble）。只钉住巴法云那边的实体标识，不影响 HA 的实体名/设备名。',
             serverSection: '服务器',
             webPort: 'Web 端口',
             retention: '数据保留天数',
@@ -350,6 +366,9 @@
             xiaomiImport: '导入选中（{{n}} 台）',
             xiaomiImportEmpty: '请至少选择一台设备',
             xiaomiImporting: '正在导入...',
+            xiaomiImportAdoptedNote: '其中「{{name}}」已写入主设备。',
+            xiaomiImportClosed: '已填入 {{n}} 台设备，还没保存——点下方「保存配置并重启」生效',
+            xiaomiImportAdopted: '已把「{{name}}」写入主设备（新增 {{added}} 台、更新 {{updated}} 台）。别忘了点「保存配置并重启」生效',
             xiaomiImportDone: '已填入设备卡片：新增 {{added}} 台、更新 {{updated}} 台。别忘了点「保存配置并重启」生效',
             xiaomiImportDoneWithFailed: '已填入设备卡片：新增 {{added}} 台、更新 {{updated}} 台、失败 {{failed}} 台。别忘了点「保存配置并重启」生效',
             xiaomiImportFailed: '导入失败',
@@ -379,7 +398,24 @@
             confirmRemoveDevice: '删除充电器「{{name}}」？保存并重启后生效。',
             invalidDeviceId: '「{{name}}」的设备 ID 非法：只允许小写字母、数字、_ 和 -，且以字母或数字开头',
             needMacToken: '「{{name}}」缺少 MAC 或 Token',
-            deviceAdded: '已添加一台充电器，填好 MAC / Token 后保存'
+            deviceAdded: '已添加一台充电器，填好 MAC / Token 后保存',
+
+            // ── 主设备生命周期（换主设备 / 清空 / 首次引导）──
+            // primary 就是配置文件 `ble:` 节，id 恒为 default，不能删除；换机或
+            // 云上残留同名设备时只能"换"或"清空"，这两个动作必须有明确入口。
+            unconfiguredTag: '待配置',
+            primaryUnconfigured: '还没配置 · 点「编辑」手填，或用右上角「小米云自动获取」扫码',
+            primaryOnboarding: '还没有可用的主设备：点右上角「小米云自动获取」扫码，或手动填 MAC / Token / BLE Key',
+            promotePrimary: '设为主设备',
+            promoteHint: '换机、或主设备和实机对不上时用：它会接管主设备的 MQTT 主题与历史锚点，原来的主设备降级成附加设备（可再删除）。',
+            promoteConfirm: '把「{{name}}」设为主设备？它会接管主设备的 MQTT 主题与历史锚点，原来的主设备会降级成附加设备并换一个新设备 ID（保存并重启后生效）。',
+            promoteNeedsCreds: '「{{name}}」还缺 MAC 或 Token，先填好再设为主设备',
+            promoted: '已把「{{name}}」设为主设备，记得点「保存配置并重启」',
+            clearPrimary: '清空主设备',
+            clearPrimaryHint: '主设备连不上/旧机器时用：清掉名称/MAC/Token/BLE Key，之后可以重新扫码导入。',
+            clearPrimaryConfirm: '清空主设备？名称/MAC/Token/BLE Key 都会清掉。清空后可以重新扫码导入。',
+            primaryCleared: '主设备已清空，点「保存配置并重启」生效',
+            primaryNeedsCreds: '「{{name}}」还没配好：有附加设备时主设备必须先有 MAC 和 Token。可以把一台附加设备「设为主设备」，或清空主设备后重新扫码导入。'
         },
 
         // ── Device switcher（多设备共用，index.html / phone.html）──
